@@ -536,6 +536,12 @@ final class SessionManager {
     @ObservationIgnored private var backstopArmedFor: Date?
     /// The session whose lease cap has been announced, so it is once.
     @ObservationIgnored private var leaseCapAnnouncedFor: Date?
+    /// Cap of the open lease window (`SessionMath.leaseStart`). Kept in
+    /// memory only: quitting or relaunching is a person's act and opens a
+    /// fresh window, and nothing here touches the journal the backstop reads.
+    @ObservationIgnored private var leaseWindowCap: Date?
+    /// The window (its cap) whose cool-down refusal has been announced.
+    @ObservationIgnored private var leaseRefusalAnnouncedFor: Date?
 
     private enum KeptSessionFile {
         /// Opening or reading it failed, or it is not a regular file.
@@ -1073,7 +1079,7 @@ final class SessionManager {
         guard session != nil, pendingEnd == nil, !quitRequested, unfinishedCommand == nil else { return }
         let ticket = endTicket
         guard case let .success(outcome) = await exclusive("sleep check", { await self.performSleepCheck(ticket: ticket) }) else { return }
-        if outcome == .revert {
+        if outcome == .revert, endTicket == ticket {
             await end(reason: .sleepReverted)
         }
     }
@@ -1253,7 +1259,7 @@ final class SessionManager {
         await settleEarlierCommand()
     }
 
-    private func performStart(duration: TimeInterval, ticket: Int, origin: SessionOrigin = .user) async {
+    private func performStart(duration: TimeInterval, ticket: Int, origin: SessionOrigin = .user, leaseWindowCap: Date? = nil) async {
         guard session == nil else {
             Log.info("start ignored: session already active")
             return
@@ -1264,7 +1270,7 @@ final class SessionManager {
         }
         let now = clock()
         let new = origin == .lease
-            ? SessionMath.newLeaseSession(now: now, lease: duration, maxLeaseHours: config.maxLeaseHours)
+            ? SessionMath.newLeaseSession(now: now, lease: duration, maxLeaseHours: config.maxLeaseHours, windowCap: leaseWindowCap)
             : SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
         // What was on disk before this attempt, read under the lock. A
         // rollback puts exactly this back: an entry an earlier failed restore
@@ -1412,7 +1418,26 @@ final class SessionManager {
         let ticket = endTicket
         _ = await exclusive("lease") {
             if self.session == nil {
-                await self.performStart(duration: length, ticket: ticket, origin: .lease)
+                let now = self.clock()
+                var windowCap: Date?
+                switch SessionMath.leaseStart(windowCap: self.leaseWindowCap, now: now, maxLeaseHours: self.config.maxLeaseHours) {
+                case let .refused(until):
+                    Log.info("lease refused: the lease limit was reached; leases start again at \(self.iso(until))")
+                    if self.leaseRefusalAnnouncedFor != self.leaseWindowCap {
+                        self.leaseRefusalAnnouncedFor = self.leaseWindowCap
+                        self.notifier.post(
+                            title: Self.leaseCapTitle,
+                            body: "Agent leases are paused until \(self.iso(until)). Start a session yourself to keep this Mac awake sooner."
+                        )
+                    }
+                    return
+                case let .resume(cap):
+                    windowCap = cap
+                case .fresh:
+                    break
+                }
+                await self.performStart(duration: length, ticket: ticket, origin: .lease, leaseWindowCap: windowCap)
+                if let s = self.session, s.origin == .lease, windowCap == nil { self.leaseWindowCap = s.leaseCapAt }
             } else {
                 await self.performLeaseExtend(lease: length, ticket: ticket)
             }

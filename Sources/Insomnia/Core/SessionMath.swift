@@ -46,10 +46,31 @@ enum SessionMath {
 
     /// New session for the first lease. At least `minimumDuration`, so a
     /// zero `maxLeaseHours` still gives the one minute every session has.
-    static func newLeaseSession(now: Date, lease: TimeInterval, maxLeaseHours: Double) -> Session {
-        let cap = leaseCap(firstLeaseAt: now, maxLeaseHours: maxLeaseHours, humanEndsAt: nil)
+    /// `windowCap` is the cap of a lease window still open: the new session
+    /// keeps it instead of starting a fresh one.
+    static func newLeaseSession(now: Date, lease: TimeInterval, maxLeaseHours: Double, windowCap: Date? = nil) -> Session {
+        let cap = windowCap ?? leaseCap(firstLeaseAt: now, maxLeaseHours: maxLeaseHours, humanEndsAt: nil)
         let end = endsAt(start: now, duration: lease, maxDuration: cap.timeIntervalSince(now))
         return Session(startedAt: now, endsAt: end, origin: .lease, leaseCapAt: cap)
+    }
+
+    /// What a lease may do when no session runs. A lease window opens at the
+    /// first lease and holds `maxLeaseHours` of lease time, however many
+    /// sessions it spans, so `lease-end` or a cap end followed by `lease`
+    /// does not buy a fresh cap. After the window closes, new leases are
+    /// refused for another `maxLeaseHours` (the cool-down); a person's own
+    /// session start is not affected.
+    enum LeaseStart: Equatable {
+        case fresh
+        case resume(cap: Date)
+        case refused(until: Date)
+    }
+
+    static func leaseStart(windowCap: Date?, now: Date, maxLeaseHours: Double) -> LeaseStart {
+        guard let windowCap else { return .fresh }
+        if now < windowCap { return .resume(cap: windowCap) }
+        let until = windowCap.addingTimeInterval(max(maxLeaseHours, 0) * 3600)
+        return now < until ? .refused(until: until) : .fresh
     }
 
     /// What a lease of `lease` seconds does to a running session.

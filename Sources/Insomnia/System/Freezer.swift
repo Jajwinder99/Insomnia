@@ -23,8 +23,14 @@ struct ProcessEntry: Sendable, Equatable, Hashable {
         self.executable = executable
     }
 
-    /// The claude CLI: executable name "claude" or a path ending in "/claude".
-    var isClaude: Bool { executable == "claude" || executable.hasSuffix("/claude") }
+    /// The claude CLI: executable name "claude", a path ending in "/claude",
+    /// or the versioned file of the native install
+    /// (`~/.local/share/claude/versions/2.1.5`), which `proc_pidpath` returns
+    /// under that name.
+    var isClaude: Bool {
+        executable == "claude" || executable.hasSuffix("/claude")
+            || executable.contains("/claude/versions/") || executable.contains("/.local/share/claude/")
+    }
 }
 
 /// One running GUI app as seen by NSWorkspace.
@@ -377,7 +383,12 @@ enum FreezePlanner {
                 expectedParents[process.pid] = process.ppid
                 identities[process.pid] = process.identity
             }
-            if refused, pids.isEmpty { continue }
+            // An app with any protected process is left whole: stopping the
+            // rest would hang its UI and block the protected part's output.
+            if refused {
+                Log.info("freeze: \(instances[0].name) holds part of the agent's process tree, left running as a whole")
+                continue
+            }
             out.append(FreezeGroup(bundleId: id, name: instances[0].name, pids: pids, expectedParents: expectedParents, identities: identities))
         }
         return out

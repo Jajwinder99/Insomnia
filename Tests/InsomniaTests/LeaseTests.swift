@@ -41,6 +41,26 @@ final class LeaseMathTests: XCTestCase {
         XCTAssertEqual(again.session.endsAt, s.endsAt)
     }
 
+    func testLeaseStartWindowResumesThenCoolsDownThenOpensFresh() {
+        let cap = t0.addingTimeInterval(4 * hour)
+        XCTAssertEqual(SessionMath.leaseStart(windowCap: nil, now: t0, maxLeaseHours: 4), .fresh)
+        XCTAssertEqual(SessionMath.leaseStart(windowCap: cap, now: t0.addingTimeInterval(hour), maxLeaseHours: 4), .resume(cap: cap))
+        XCTAssertEqual(
+            SessionMath.leaseStart(windowCap: cap, now: cap, maxLeaseHours: 4),
+            .refused(until: cap.addingTimeInterval(4 * hour))
+        )
+        XCTAssertEqual(SessionMath.leaseStart(windowCap: cap, now: cap.addingTimeInterval(4 * hour), maxLeaseHours: 4), .fresh)
+        let resumed = SessionMath.newLeaseSession(now: t0.addingTimeInterval(hour), lease: 600, maxLeaseHours: 4, windowCap: cap)
+        XCTAssertEqual(resumed.leaseCapAt, cap, "a resumed window keeps its cap")
+    }
+
+    func testCapClampsAnExtendAndEndsAtTheCap() {
+        let s = SessionMath.newLeaseSession(now: t0, lease: 600, maxLeaseHours: 1)
+        let r = SessionMath.leased(s, lease: 3600, now: t0.addingTimeInterval(3000), maxLeaseHours: 1)
+        XCTAssertEqual(r.session.endsAt, t0.addingTimeInterval(hour), "the end is clamped to the cap, not now + lease")
+        XCTAssertTrue(r.capped)
+    }
+
     func testLeaseNeverShortensAHumanEnd() {
         let human = Session(startedAt: t0, endsAt: t0.addingTimeInterval(8 * hour))
         let r = SessionMath.leased(human, lease: 600, now: t0.addingTimeInterval(60), maxLeaseHours: 4)
@@ -286,6 +306,38 @@ final class LeaseManagerTests: XCTestCase {
         try await send(m, lease(60))
         XCTAssertEqual(m.session?.endsAt, start.addingTimeInterval(3600), "the cap holds")
         XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.leaseCapTitle }.count, 1)
+    }
+
+    func testNewLeaseAfterTheCapEndsIsRefusedUntilTheCoolDownPasses() async throws {
+        let m = h.makeManager()
+        enable(m)
+        m.config.maxLeaseHours = 1
+        try await send(m, lease(60))
+        let start = h.clock.now
+        _ = await m.end(reason: .timer)
+        XCTAssertNil(m.session)
+
+        // lease-end then lease inside the window resumes it with the old cap.
+        h.clock.advance(1800)
+        try await send(m, lease(60))
+        XCTAssertEqual(m.session?.leaseCapAt, start.addingTimeInterval(hour), "no fresh cap")
+        XCTAssertEqual(m.session?.endsAt, start.addingTimeInterval(hour))
+        _ = await m.end(reason: .timer)
+
+        // After the cap, a new lease is refused and announced once.
+        h.clock.advance(1800)
+        try await send(m, lease(10))
+        XCTAssertNil(m.session)
+        h.clock.advance(60)
+        try await send(m, lease(10))
+        XCTAssertNil(m.session)
+        XCTAssertEqual(h.notifier.posts.filter { $0.title == SessionManager.leaseCapTitle }.count, 1)
+
+        // A person can still start a session, and leases work after the cool-down.
+        h.clock.advance(3600)
+        try await send(m, lease(10))
+        XCTAssertEqual(m.session?.origin, .lease)
+        XCTAssertEqual(m.session?.leaseCapAt, h.clock.now.addingTimeInterval(hour), "a fresh window")
     }
 
     func testLeaseOnAHumanSessionNeverShortensIt() async throws {

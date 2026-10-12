@@ -425,6 +425,35 @@ final class FreezerTests: XCTestCase {
         XCTAssertFalse(ProcessEntry(pid: 1, ppid: 0, startedAt: 1, executable: "").isClaude)
     }
 
+    func testClaudeIsFoundAtTheNativeInstallVersionedPath() {
+        XCTAssertTrue(ProcessEntry(pid: 1, ppid: 0, startedAt: 1, executable: "/Users/me/.local/share/claude/versions/2.1.5").isClaude)
+        XCTAssertTrue(ProcessEntry(pid: 1, ppid: 0, startedAt: 1, executable: "/opt/claude/versions/2.1.5").isClaude)
+        XCTAssertFalse(ProcessEntry(pid: 1, ppid: 0, startedAt: 1, executable: "/Users/me/.local/share/other/versions/2.1.5").isClaude)
+    }
+
+    func testAppHoldingPartOfTheAgentTreeIsLeftWhole() {
+        // A terminal that is not on the agent list runs the versioned claude.
+        // The terminal, its shell and claude are protected; its renderer is
+        // not on that path but must not be stopped alone.
+        let procs = [
+            ProcessEntry(pid: 1, ppid: 0, startedAt: 1),
+            ProcessEntry(pid: 500, ppid: 1, startedAt: 5000, executable: "/Applications/Term.app/Contents/MacOS/Term"),
+            ProcessEntry(pid: 501, ppid: 500, startedAt: 5001, executable: "/bin/zsh"),
+            ProcessEntry(pid: 502, ppid: 501, startedAt: 5002, executable: "/Users/me/.local/share/claude/versions/2.1.5"),
+            ProcessEntry(pid: 503, ppid: 500, startedAt: 5003, executable: "Term Helper (Renderer)"),
+            ProcessEntry(pid: 600, ppid: 1, startedAt: 6000),
+        ]
+        let apps = [
+            RunningApp(pid: 500, bundleId: "com.example.term", name: "Term"),
+            RunningApp(pid: 600, bundleId: "com.example.other", name: "Other"),
+        ]
+        var c = Config()
+        c.agentList = []
+        let groups = FreezePlanner.groups(bundleIds: ["com.example.term", "com.example.other"], apps: apps, processes: procs, config: c)
+        XCTAssertEqual(groups.map(\.bundleId), ["com.example.other"])
+        XCTAssertEqual(groups.flatMap(\.pids), [600])
+    }
+
     func testPlanOnLidCloseDefaultsFreezesOnlyTheNonAgentApps() {
         // Default freezeList plus Obsidian, through the lid-close scope.
         var c = Config()
