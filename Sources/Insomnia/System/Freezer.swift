@@ -512,7 +512,9 @@ struct Freezer: Freezing {
     /// process) falls back to `p_comm`.
     private static func executable(of p: kinfo_proc) -> String {
         var path = [CChar](repeating: 0, count: 4096)
-        if proc_pidpath(p.kp_proc.p_pid, &path, UInt32(path.count)) > 0 { return String(cString: path) }
+        if proc_pidpath(p.kp_proc.p_pid, &path, UInt32(path.count)) > 0 {
+            return String(decoding: path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
         var comm = p.kp_proc.p_comm
         let capacity = MemoryLayout.size(ofValue: comm)
         return withUnsafePointer(to: &comm) {

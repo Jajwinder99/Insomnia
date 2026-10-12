@@ -207,6 +207,7 @@ final class LeaseRequestTests: XCTestCase {
 @MainActor
 final class LeaseManagerTests: XCTestCase {
     var h: Harness!
+    let hour: TimeInterval = 3600
 
     override func setUp() async throws { h = Harness() }
     override func tearDown() async throws { h.home.destroy() }
