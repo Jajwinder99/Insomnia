@@ -19,6 +19,9 @@ enum EndReason: String, Sendable {
     /// may still have been applied, so the start is undone from the journal
     /// like an end rather than rolled back from memory.
     case startFailed
+    /// SleepDisabled read 0 mid-session and could not be put back: the
+    /// reapply failed, or the bit read 0 again at the next check.
+    case sleepReverted
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -461,6 +464,9 @@ final class SessionManager {
     /// An end that could not complete (lock busy, or dirty with no agent to
     /// retry). Retried in process; new starts wait until it is resolved.
     @ObservationIgnored private(set) var pendingEnd: EndReason?
+    /// The last sleep check read SleepDisabled 0 and reapplied it. A second
+    /// 0 at the next check ends the session (`checkSleepDisabled`).
+    @ObservationIgnored private var sleepReapplied = false
     /// Tail of the lifecycle queue.
     @ObservationIgnored private var lifecycleTail: Task<Void, Never>?
     /// Detail of the last unreadable-journal notification, so a journal
@@ -1041,6 +1047,63 @@ final class SessionManager {
         if !checked { scheduleSettleRetry() }
     }
 
+    /// What one pass of `checkSleepDisabled` decided.
+    private enum SleepCheck: Sendable {
+        case skipped, held, reapplied, revert
+    }
+
+    /// Reads SleepDisabled while a session runs (AppServices calls it every
+    /// 60 s). powerd can clear the bit long after the 5 s read back at
+    /// start (seen on macOS 26.6.2), and a closed lid then sleeps with no
+    /// warning. A 0 is reapplied once with `disablesleep 1`, the command the
+    /// sudoers file already allows. The reapply failing, or a 0 again at the
+    /// next check, ends the session with `sleepReverted`. Read and reapply
+    /// run under the recovery lock, and nothing runs while an end is
+    /// pending, a quit is requested or a command is left running, so the
+    /// check can never fight an end or leave sleep disabled after one.
+    func checkSleepDisabled() async {
+        guard session != nil, pendingEnd == nil, !quitRequested, unfinishedCommand == nil else { return }
+        let ticket = endTicket
+        guard case let .success(outcome) = await exclusive("sleep check", { await self.performSleepCheck(ticket: ticket) }) else { return }
+        if outcome == .revert {
+            await end(reason: .sleepReverted)
+        }
+    }
+
+    private func performSleepCheck(ticket: Int) async -> SleepCheck {
+        // Checked again under the lock: an end or quit that queued ahead of
+        // this check has already run, and sleep must stay as it left it.
+        // Without the journal entry the bit is not ours to change.
+        guard session != nil, pendingEnd == nil, !quitRequested, endTicket == ticket, state.sleepDisabledByUs else { return .skipped }
+        do {
+            if try await sleepGuard.isSleepDisabled() {
+                sleepReapplied = false
+                return .held
+            }
+        } catch {
+            Log.error("could not read SleepDisabled during the session; checked again at the next check: \(error.localizedDescription)")
+            return .held
+        }
+        guard !sleepReapplied else {
+            Log.error("SleepDisabled read 0 again after it was reapplied; ending the session")
+            return .revert
+        }
+        guard endTicket == ticket else { return .skipped }
+        Log.error("SleepDisabled read 0 during the session; reapplying disablesleep 1")
+        do {
+            try await sleepGuard.setSleepDisabled(true)
+        } catch let still as CommandStillRunningError {
+            stopTransaction(for: still, thenEnd: .sleepReverted)
+            return .skipped
+        } catch {
+            Log.error("could not reapply disablesleep 1; ending the session: \(error.localizedDescription)")
+            return .revert
+        }
+        sleepReapplied = true
+        Log.info("disablesleep 1 reapplied; SleepDisabled reads 1 again")
+        return .reapplied
+    }
+
     private func scheduleSettleRetry() {
         settleRetry?.cancel()
         let delay = recoveryRetryDelay
@@ -1356,6 +1419,7 @@ final class SessionManager {
         Log.info("session end (\(reason.rawValue))")
         stopTimers()
         countdownPaused = false
+        sleepReapplied = false
         session = nil
         // Every lid action is undone from the journal below, or by the
         // retry of this end, and Low Power Mode restored from it: a lid
@@ -3185,6 +3249,7 @@ final class SessionManager {
             : "A previous session left changes behind; everything has been undone."
         case .recoveryUnavailable: "Insomnia could not arm its recovery agent for the session found on disk, so it ended the session. Sleep is back to normal."
         case .startFailed: "Insomnia could not disable sleep, so no session was started. Sleep is back to normal."
+        case .sleepReverted: "macOS kept turning sleep back on during the session, so closing the lid would have put this Mac to sleep. Insomnia ended the session. Sleep is back to normal."
         }
     }
 }

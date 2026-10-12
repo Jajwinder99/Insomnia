@@ -75,6 +75,9 @@ final class AppServices {
     private let sampler: BrightnessSampler
     private static let sampleInterval: TimeInterval = 30
     private static let sampleLeeway: DispatchTimeInterval = .seconds(5)
+    /// SleepDisabled is read this often while a session runs; see
+    /// `SessionManager.checkSleepDisabled`.
+    private static let sleepCheckInterval: TimeInterval = 60
     private static let postOpenSampleDelay: Duration = .seconds(3)
 
     private weak var manager: SessionManager?
@@ -90,6 +93,7 @@ final class AppServices {
     private var relaunchCount = 0
     private var newestRelaunch: [String: Int] = [:]
     private var sampleTimer: (any DispatchSourceTimer)?
+    private var sleepCheckTimer: (any DispatchSourceTimer)?
     private var postOpenSampleTask: Task<Void, Never>?
     /// The state of the last lid event, from the hinge or the simulation
     /// trigger, run or refused. `status.lidClosed` is no stand-in for it:
@@ -166,6 +170,13 @@ final class AppServices {
         }
         sampleTimer = timer
         timer.resume()
+        let sleepTimer = DispatchSource.makeTimerSource(queue: .main)
+        sleepTimer.schedule(deadline: .now() + Self.sleepCheckInterval, repeating: Self.sleepCheckInterval, leeway: Self.sampleLeeway)
+        sleepTimer.setEventHandler { [weak manager] in
+            Task { @MainActor in await manager?.checkSleepDisabled() }
+        }
+        sleepCheckTimer = sleepTimer
+        sleepTimer.resume()
         startLidSimulation()
 
         power.onChange = { [weak self] in self?.powerChanged() }
@@ -203,6 +214,8 @@ final class AppServices {
         power.onChange = nil
         sampleTimer?.cancel()
         sampleTimer = nil
+        sleepCheckTimer?.cancel()
+        sleepCheckTimer = nil
         postOpenSampleTask?.cancel()
         postOpenSampleTask = nil
         networkTask?.cancel()
