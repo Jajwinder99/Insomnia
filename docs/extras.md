@@ -84,6 +84,54 @@ relaunch that ends after its session ended, or after a newer relaunch of the
 same browser started, reports nothing. This is not a guarantee that every web
 app will keep working while the lid is closed.
 
+## Agent leases
+
+A coding agent can keep the Mac awake only while it works. This is off by
+default. To turn it on, set `"allowExternalControl": true` in `config.json`
+and relaunch Insomnia. Without it, every request is deleted unread.
+
+Two commands talk to the running app. They open no window and no second copy
+of the app, and they exit with an error when Insomnia is not running:
+
+```bash
+~/Applications/Insomnia.app/Contents/MacOS/Insomnia lease 10
+~/Applications/Insomnia.app/Contents/MacOS/Insomnia lease-end
+```
+
+`lease <minutes>` (1 to 60) starts a session of that length when none is
+running. When one is running, it moves the end to now plus the lease, never
+sooner than the end it already has. Repeat leases do not add up, and a lease
+that would move the end by less than 60 s is skipped. `lease-end` ends a
+session that leases started and does nothing to a session you started. If you
+extend a lease session yourself, it becomes yours and `lease-end` leaves it
+alone.
+
+When the hooks stop, the last lease runs out and the session ends by itself.
+Leases cannot keep a session going past 4 hours after the first one, or past
+the end time you chose, whichever is later. Change the 4 with
+`"maxLeaseHours"` in `config.json`. At the limit Insomnia notifies once and
+the session then ends on schedule.
+
+The command leaves a request file, `lease-request.json`, in the Application
+Support folder. Insomnia reads and deletes it when the command wakes it, or
+within 30 s. It acts only on a file that is mode 0600, owned by you, under
+2 minutes old, and in range. Any program that runs as you can write that
+file, so turn this on only if you accept that.
+
+Example for Claude Code, in `~/.claude/settings.json`. A lease on every
+prompt and tool call keeps the Mac awake while the agent works, and `Stop`
+ends the session when it finishes:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/Applications/Insomnia.app/Contents/MacOS/Insomnia lease 10 || true"}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "~/Applications/Insomnia.app/Contents/MacOS/Insomnia lease 10 || true"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "~/Applications/Insomnia.app/Contents/MacOS/Insomnia lease-end || true"}]}]
+  }
+}
+```
+
 ## Configuration and privacy
 
 Configuration lives in `~/Library/Application Support/Insomnia/config.json`.

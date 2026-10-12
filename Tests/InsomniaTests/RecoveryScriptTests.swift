@@ -87,6 +87,27 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.session))
     }
 
+    /// Lease sessions add `origin` and `leaseCapAt` to session.json. The
+    /// shell ignores both, as it ignores any extra key, so a future session
+    /// still counts as valid even when a value has the wrong type (the app
+    /// reads such a value as a user session).
+    func testLeaseKeysInSessionJSONAreIgnoredByTheShell() throws {
+        let f = ISO8601DateFormatter()
+        let start = f.string(from: Date(timeIntervalSinceNow: -60))
+        let end = f.string(from: Date(timeIntervalSinceNow: 3600))
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        for extra in [#""origin":"lease","leaseCapAt":"\#(end)""#, #""origin":7,"leaseCapAt":true"#] {
+            try #"{"startedAt":"\#(start)","endsAt":"\#(end)","extensions":[],\#(extra)}"#.write(to: fx.session, atomically: true, encoding: .utf8)
+            try fx.writeState(dirty)
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+            XCTAssertEqual(fx.calls(), [], extra)
+            XCTAssertTrue(fx.exists(fx.session), extra)
+        }
+    }
+
     func testForceEndsValidSession() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)

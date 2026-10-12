@@ -26,6 +26,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: StatusItemController?
     private var settingsWindow: SettingsWindow?
     private var terminating = false
+    private var leaseObserver: (any NSObjectProtocol)?
+    private var leaseTimer: Timer?
 
     override init() {
         let manager = SessionManager.live()
@@ -85,6 +87,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings?.show()
         }
         Task { await manager.reconcile() }
+        watchForLeaseRequests()
+    }
+
+    /// `Insomnia lease` posts a hint and leaves a request file. The 30 s
+    /// timer reads it too, in case the hint is lost or arrives before the
+    /// app is listening. Without a file each check is one stat call.
+    private func watchForLeaseRequests() {
+        let check: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor in await self?.manager.processLeaseRequest() }
+        }
+        leaseObserver = DistributedNotificationCenter.default().addObserver(
+            forName: LeaseCommand.notification, object: nil, queue: .main
+        ) { _ in check() }
+        let timer = Timer(timeInterval: 30, repeats: true) { _ in check() }
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        leaseTimer = timer
     }
 
     /// Quitting always ends the session (spec 1). Terminate is deferred until

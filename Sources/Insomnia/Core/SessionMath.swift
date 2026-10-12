@@ -34,6 +34,48 @@ enum SessionMath {
         return s
     }
 
+    /// A lease that would move `endsAt` out by less than this is not written.
+    static let leaseDebounce: TimeInterval = 60
+
+    /// The latest end leases may reach: `maxLeaseHours` after the first
+    /// lease, or the end time a person chose, whichever is later.
+    static func leaseCap(firstLeaseAt: Date, maxLeaseHours: Double, humanEndsAt: Date?) -> Date {
+        let byHours = firstLeaseAt.addingTimeInterval(max(maxLeaseHours, 0) * 3600)
+        return max(byHours, humanEndsAt ?? byHours)
+    }
+
+    /// New session for the first lease. At least `minimumDuration`, so a
+    /// zero `maxLeaseHours` still gives the one minute every session has.
+    static func newLeaseSession(now: Date, lease: TimeInterval, maxLeaseHours: Double) -> Session {
+        let cap = leaseCap(firstLeaseAt: now, maxLeaseHours: maxLeaseHours, humanEndsAt: nil)
+        let end = endsAt(start: now, duration: lease, maxDuration: cap.timeIntervalSince(now))
+        return Session(startedAt: now, endsAt: end, origin: .lease, leaseCapAt: cap)
+    }
+
+    /// What a lease of `lease` seconds does to a running session.
+    /// `session` is the session to write, equal to the one passed in when
+    /// nothing needs writing. `capped` is true when the cap held the end
+    /// back. The end is `max(endsAt, now + lease)` held to the cap, so
+    /// repeat leases do not stack, a lease never shortens a session, and a
+    /// move of under `leaseDebounce` is dropped. The first lease on a
+    /// session records its cap even when the end does not move.
+    static func leased(_ session: Session, lease: TimeInterval, now: Date, maxLeaseHours: Double) -> (session: Session, capped: Bool) {
+        var s = session
+        let cap = session.leaseCapAt ?? leaseCap(
+            firstLeaseAt: now,
+            maxLeaseHours: maxLeaseHours,
+            humanEndsAt: session.origin == .user ? session.endsAt : nil
+        )
+        s.leaseCapAt = cap
+        let ceiling = max(cap, session.endsAt)
+        let wanted = now.addingTimeInterval(lease)
+        let newEnd = max(session.endsAt, min(wanted, ceiling))
+        if newEnd.timeIntervalSince(session.endsAt) >= leaseDebounce {
+            s.endsAt = newEnd
+        }
+        return (s, wanted > ceiling)
+    }
+
     /// Seconds from `now` to `endsAt`, floored at zero.
     static func remaining(until endsAt: Date, at now: Date) -> TimeInterval {
         max(endsAt.timeIntervalSince(now), 0)

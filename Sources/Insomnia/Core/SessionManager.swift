@@ -22,6 +22,8 @@ enum EndReason: String, Sendable {
     /// SleepDisabled read 0 mid-session and could not be put back: the
     /// reapply failed, or the bit read 0 again at the next check.
     case sleepReverted
+    /// `Insomnia lease-end` ended a session that leases started.
+    case leaseEnded
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -528,6 +530,12 @@ final class SessionManager {
     /// change (`Config.lidCloseDefaultsNotice`) for a user who has
     /// notifications turned off.
     @ObservationIgnored private var pendingLidCloseNotice: LidCloseDefaultsChange?
+    /// The session (its `startedAt`) whose backstop this process has
+    /// confirmed loaded, by the arm at its start or at an extend. A small
+    /// lease extend does not arm again for that session.
+    @ObservationIgnored private var backstopArmedFor: Date?
+    /// The session whose lease cap has been announced, so it is once.
+    @ObservationIgnored private var leaseCapAnnouncedFor: Date?
 
     private enum KeptSessionFile {
         /// Opening or reading it failed, or it is not a regular file.
@@ -1245,7 +1253,7 @@ final class SessionManager {
         await settleEarlierCommand()
     }
 
-    private func performStart(duration: TimeInterval, ticket: Int) async {
+    private func performStart(duration: TimeInterval, ticket: Int, origin: SessionOrigin = .user) async {
         guard session == nil else {
             Log.info("start ignored: session already active")
             return
@@ -1255,7 +1263,9 @@ final class SessionManager {
             return
         }
         let now = clock()
-        let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
+        let new = origin == .lease
+            ? SessionMath.newLeaseSession(now: now, lease: duration, maxLeaseHours: config.maxLeaseHours)
+            : SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
         // What was on disk before this attempt, read under the lock. A
         // rollback puts exactly this back: an entry an earlier failed restore
         // left behind is evidence, not something this start may clear.
@@ -1286,6 +1296,7 @@ final class SessionManager {
         // at any later point already has launchd polling the deadline.
         do {
             try await backstop.arm()
+            backstopArmedFor = new.startedAt
         } catch {
             rollBackStart(journal: journalBefore, session: sessionBefore)
             fail("could not arm backstop: \(error.localizedDescription)")
@@ -1339,11 +1350,15 @@ final class SessionManager {
 
     private func performExtend(by extra: TimeInterval, ticket: Int) async {
         guard let current = session, endTicket == ticket else { return }
-        let updated = SessionMath.extended(current, by: extra, now: clock(), maxDuration: config.maxDuration)
+        var updated = SessionMath.extended(current, by: extra, now: clock(), maxDuration: config.maxDuration)
+        // A person who extends a lease session takes it over: lease-end
+        // no longer ends it.
+        updated.origin = .user
         // The agent enforces whatever deadline is on disk; confirm it is
         // still loaded before moving that deadline out.
         do {
             try await backstop.arm()
+            backstopArmedFor = current.startedAt
         } catch {
             fail("could not confirm backstop: \(error.localizedDescription)")
             return
@@ -1363,6 +1378,102 @@ final class SessionManager {
         Log.info("session extended by \(Int(extra))s until \(iso(updated.endsAt))")
         await armDeadline(updated.endsAt)
     }
+
+    // MARK: Agent leases
+
+    /// Handles the request file `Insomnia lease` or `lease-end` left, if
+    /// any. Called when the wake-up notification arrives and by a 30 s
+    /// timer (`AppDelegate`). The file is deleted whatever it holds.
+    func processLeaseRequest() async {
+        guard let taken = LeaseInbox.take(paths: paths) else { return }
+        guard let request = taken.request else {
+            Log.info("lease request refused: \(taken.problem ?? "unreadable")")
+            return
+        }
+        switch request.action(now: clock(), allowExternalControl: config.allowExternalControl, owner: taken.owner, mode: taken.mode) {
+        case let .failure(refusal):
+            Log.info("lease request refused: \(refusal)")
+        case let .success(.lease(minutes)):
+            await lease(minutes: minutes)
+        case .success(.end):
+            await endLease()
+        }
+    }
+
+    /// A lease of `minutes` (1 to 60): starts a session when there is none,
+    /// otherwise moves its end out by the lease rules in
+    /// `SessionMath.leased`. Bounded by `config.maxDuration` like any session.
+    func lease(minutes: Int) async {
+        guard !quitRequested, pendingEnd == nil else {
+            Log.info("lease ignored: quit or an end is pending")
+            return
+        }
+        let length = min(TimeInterval(minutes) * 60, max(config.maxDuration, SessionMath.minimumDuration))
+        let ticket = endTicket
+        _ = await exclusive("lease") {
+            if self.session == nil {
+                await self.performStart(duration: length, ticket: ticket, origin: .lease)
+            } else {
+                await self.performLeaseExtend(lease: length, ticket: ticket)
+            }
+        }
+        await settleEarlierCommand()
+    }
+
+    private func performLeaseExtend(lease: TimeInterval, ticket: Int) async {
+        guard let current = session, endTicket == ticket else { return }
+        let now = clock()
+        let plan = SessionMath.leased(current, lease: lease, now: now, maxLeaseHours: config.maxLeaseHours)
+        if plan.capped, leaseCapAnnouncedFor != current.startedAt {
+            leaseCapAnnouncedFor = current.startedAt
+            let until = plan.session.leaseCapAt.map(iso) ?? "the cap"
+            Log.info("lease cap reached: leases cannot keep the session past \(until)")
+            notifier.post(
+                title: Self.leaseCapTitle,
+                body: "Agent leases will not keep this Mac awake past the \(Int(config.maxLeaseHours)) hour limit. End it yourself or extend the session to go longer."
+            )
+        }
+        let updated = plan.session
+        guard updated != current else { return }
+        // The backstop is confirmed once per session; a lease moves the end
+        // by at most an hour, so it is not asked again for each one.
+        if updated.endsAt != current.endsAt, backstopArmedFor != current.startedAt {
+            do {
+                try await backstop.arm()
+                backstopArmedFor = current.startedAt
+            } catch {
+                fail("could not confirm backstop: \(error.localizedDescription)")
+                return
+            }
+        }
+        guard endTicket == ticket, session == current else {
+            Log.info("lease abandoned: end requested meanwhile")
+            return
+        }
+        do {
+            try store.saveSession(updated)
+        } catch {
+            fail("could not write session: \(error.localizedDescription)")
+            return
+        }
+        session = updated
+        guard updated.endsAt != current.endsAt else { return }
+        lastError = nil
+        Log.info("lease moved the session end to \(iso(updated.endsAt))")
+        await armDeadline(updated.endsAt)
+    }
+
+    /// Ends the session only if leases started it and no person has taken
+    /// it over. A session you started yourself is left alone.
+    func endLease() async {
+        guard session?.origin == .lease else {
+            Log.info("lease-end ignored: no lease session")
+            return
+        }
+        await end(reason: .leaseEnded)
+    }
+
+    static let leaseCapTitle = "Agent lease limit reached"
 
     /// Full session end: delete the session file first (so a crash here leaves
     /// a clean "no session" for reconcile/backstop), then undo RuntimeState
@@ -3249,6 +3360,7 @@ final class SessionManager {
             : "A previous session left changes behind; everything has been undone."
         case .recoveryUnavailable: "Insomnia could not arm its recovery agent for the session found on disk, so it ended the session. Sleep is back to normal."
         case .startFailed: "Insomnia could not disable sleep, so no session was started. Sleep is back to normal."
+        case .leaseEnded: "The agent finished its work. Sleep is back to normal."
         case .sleepReverted: "macOS kept turning sleep back on during the session, so closing the lid would have put this Mac to sleep. Insomnia ended the session. Sleep is back to normal."
         }
     }

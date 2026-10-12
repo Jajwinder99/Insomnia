@@ -231,6 +231,7 @@ below cover what only a real Mac shows.
 - Backstop resuming a frozen test process through the installed `Insomnia --resume-frozen`, and keeping the entry when the bundle is removed or its Info.plist lacks `InsomniaResumeFrozenVersion`
 - Existing Low Power Mode preference and saved audio restoration
 - Low Power Mode on macOS 27, where `pmset -g custom` prints `powermode` and no `lowpowermode` (a session on battery with the lid closed and "Low Power Mode while the lid is closed" on, or below the Low Power floor): the log has no "could not read low power mode" line, `pmset -g custom` shows `powermode 1` under Battery Power while the mode is on, and the session end leaves it at `0`; with High Power set beforehand (`powermode 2` under Battery Power), the read is refused, the log says so, and `powermode 2` is still set after the session
+- Agent leases with `allowExternalControl` on: `Insomnia lease 10` from a terminal starts a session that sleep does not interrupt, repeat leases move the end but not past 4 hours, `lease-end` ends it, and with the app quit the command exits non-zero; with the key off nothing starts and `lease-request.json` is gone within 30 s
 - App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall
 - Battery/thermal event behavior on supported hardware
 - A `sudo pmset` that ignores SIGTERM: left running, lock held, journal intact, quit refused until it exits
