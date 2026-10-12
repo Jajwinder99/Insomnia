@@ -8,4 +8,10 @@ if let output = ResumeFrozenCommand.run(Array(CommandLine.arguments.dropFirst())
     for line in output.lines { print(line) }
     exit(output.status)
 }
+// `Insomnia lease <minutes>` and `Insomnia lease-end` hand a request to the
+// running app and never start one (LeaseCommand).
+if let output = LeaseCommand.run(Array(CommandLine.arguments.dropFirst())) {
+    for line in output.lines { print(line) }
+    exit(output.status)
+}
 InsomniaApp.main()

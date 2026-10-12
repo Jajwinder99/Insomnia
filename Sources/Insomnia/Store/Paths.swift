@@ -6,13 +6,13 @@ import Foundation
 ///
 /// Default layout:
 ///   ~/Applications/Insomnia.app/Contents/Resources/backstop.sh
-///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,unfinished-command.json}
+///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,unfinished-command.json,lease-request.json}
 ///   ~/Library/Logs/Insomnia/{insomnia.log,handoffs.log}
 ///   ~/Library/LaunchAgents/com.insomnia.backstop.plist
 ///
 /// With INSOMNIA_HOME=/x:
 ///   /x/Insomnia.app/Contents/Resources/backstop.sh
-///   /x/{session.json,state.json,config.json,unfinished-command.json}
+///   /x/{session.json,state.json,config.json,unfinished-command.json,lease-request.json}
 ///   /x/Logs/{insomnia.log,handoffs.log}
 ///   /x/LaunchAgents/com.insomnia.backstop.plist
 struct Paths: Sendable, Equatable {
@@ -88,6 +88,9 @@ struct Paths: Sendable, Equatable {
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }
+    /// Written by `Insomnia lease` and `lease-end`, read and deleted by the
+    /// running app. See LeaseCommand.
+    var leaseRequestFile: URL { appSupport.appendingPathComponent("lease-request.json") }
 
     /// Both logs are owner-only and rotate to `<name>.1` past
     /// `OwnerOnly.maxLogBytes`; uninstall.sh --purge removes the `.1` too.

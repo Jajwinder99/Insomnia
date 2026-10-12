@@ -11,6 +11,14 @@ struct Config: Codable, Equatable, Sendable {
     /// Hard ceiling on a session, including extensions. 30 days.
     var maxDuration: TimeInterval = 30 * 24 * 3600
 
+    // Agent leases (`Insomnia lease`)
+    /// Accept `Insomnia lease` and `lease-end` requests from other programs,
+    /// such as Claude Code hooks. Off: a request file is deleted unread.
+    var allowExternalControl: Bool = false
+    /// Hours after the first lease that leases may keep a session going.
+    /// The end time you chose yourself is never cut short by this.
+    var maxLeaseHours: Double = 4
+
     // Lid-close actions
     /// Bundle ids to SIGSTOP while the lid is closed.
     var freezeList: [String] = Config.defaultFreezeList
@@ -165,6 +173,8 @@ struct Config: Codable, Equatable, Sendable {
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
+        allowExternalControl = try c.decodeIfPresent(Bool.self, forKey: .allowExternalControl) ?? d.allowExternalControl
+        maxLeaseHours = try c.decodeIfPresent(Double.self, forKey: .maxLeaseHours) ?? d.maxLeaseHours
     }
 }
 

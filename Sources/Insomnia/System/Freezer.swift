@@ -11,12 +11,25 @@ struct ProcessEntry: Sendable, Equatable, Hashable {
     /// Already stopped when the snapshot was taken (by a debugger, by the
     /// user, by an earlier crash). Never ours to freeze or resume.
     let stopped: Bool
+    /// Executable path from the kernel, or the short command name when the
+    /// path cannot be read. Empty when unknown. Only used to spot `claude`.
+    let executable: String
 
-    init(pid: Int32, ppid: Int32, identity: ProcessIdentity, stopped: Bool) {
+    init(pid: Int32, ppid: Int32, identity: ProcessIdentity, stopped: Bool, executable: String = "") {
         self.pid = pid
         self.ppid = ppid
         self.identity = identity
         self.stopped = stopped
+        self.executable = executable
+    }
+
+    /// The claude CLI: executable name "claude", a path ending in "/claude",
+    /// or the versioned file of the native install
+    /// (`~/.local/share/claude/versions/2.1.5`), which `proc_pidpath` returns
+    /// under that name.
+    var isClaude: Bool {
+        executable == "claude" || executable.hasSuffix("/claude")
+            || executable.contains("/claude/versions/") || executable.contains("/.local/share/claude/")
     }
 }
 
@@ -75,6 +88,10 @@ struct FreezeGroup: Sendable, Equatable {
 /// Pure planning: denylist, lid-close scope, tree grouping. No process access.
 enum FreezePlanner {
     static let dockerBundleId = "com.docker.docker"
+    /// Chrome for Testing, which MCP servers (the LinkedIn one) launch as a
+    /// child. Never frozen, whatever the lists say. Chrome itself is not
+    /// protected by id here.
+    static let chromeForTestingBundleId = "com.google.chrome.for.testing"
 
     /// Apps the automatic lid-close scope (`Config.freezeAllApps`) leaves
     /// alone even when they are not on the agent list: agent hosts, editors,
@@ -248,14 +265,54 @@ enum FreezePlanner {
         return out
     }
 
+    /// An agent list app or one of its helpers: the id itself, or the id
+    /// followed by "." (Cursor's `com.todesktop.230313mzl4w4u92.helper...`).
+    static func isAgentApp(_ bundleId: String, config: Config) -> Bool {
+        config.agentList.contains { !$0.isEmpty && (bundleId == $0 || bundleId.hasPrefix($0 + ".")) }
+    }
+
     /// Spec section 4 hard denylist: `com.apple.*`, Insomnia itself, Docker
-    /// Desktop (handled by the Docker rule) and everything in the agent list.
+    /// Desktop (handled by the Docker rule), Chrome for Testing and everything
+    /// in the agent list, helper ids included.
     static func isDenied(_ bundleId: String, config: Config, selfBundleId: String = Paths.bundleIdentifier) -> Bool {
         if bundleId.hasPrefix("com.apple.") { return true }
         if bundleId == selfBundleId { return true }
         if bundleId == dockerBundleId { return true }
-        if config.agentList.contains(bundleId) { return true }
+        if bundleId == chromeForTestingBundleId { return true }
+        if isAgentApp(bundleId, config: config) { return true }
         return false
+    }
+
+    /// Pids the plan never stops: every process under an agent app, a
+    /// claude process or Chrome for Testing (the agent's own tree), and
+    /// every process above one of those (what started the agent). Agent
+    /// hosts run the claude CLI and MCP servers as children, and freezing
+    /// any link silently kills the agent and Remote Control. Two walks over
+    /// the snapshot, no per-process work.
+    static func agentProtectedPids(apps: [RunningApp], processes: [ProcessEntry], config: Config) -> Set<Int32> {
+        var seeds: Set<Int32> = []
+        for app in apps {
+            guard let id = app.bundleId, id == chromeForTestingBundleId || isAgentApp(id, config: config) else { continue }
+            seeds.insert(app.pid)
+        }
+        for p in processes where p.isClaude { seeds.insert(p.pid) }
+        guard !seeds.isEmpty else { return [] }
+        var parent: [Int32: Int32] = [:]
+        var children: [Int32: [Int32]] = [:]
+        for p in processes where p.pid != p.ppid {
+            parent[p.pid] = p.ppid
+            children[p.ppid, default: []].append(p.pid)
+        }
+        var protected = seeds
+        var queue = Array(seeds)
+        while let pid = queue.popLast() {
+            for child in children[pid] ?? [] where protected.insert(child).inserted { queue.append(child) }
+        }
+        for seed in seeds {
+            var up = parent[seed]
+            while let pid = up, protected.insert(pid).inserted { up = parent[pid] }
+        }
+        return protected
     }
 
     /// `root` followed by every transitive child found in `processes`.
@@ -294,6 +351,8 @@ enum FreezePlanner {
         var out: [FreezeGroup] = []
         var done: Set<String> = []
         let byPid = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        // The Docker rule passes applyDenylist false and keeps its own scope.
+        let agentPids = applyDenylist ? agentProtectedPids(apps: apps, processes: processes, config: config) : []
         for id in bundleIds where !done.contains(id) {
             done.insert(id)
             if applyDenylist, isDenied(id, config: config, selfBundleId: selfBundleId) {
@@ -303,8 +362,14 @@ enum FreezePlanner {
             let instances = apps.filter { $0.bundleId == id }
             guard !instances.isEmpty else { continue }
             var pids: [Int32] = []
+            var refused = false
             for app in instances {
                 for pid in tree(root: app.pid, in: processes) where !pids.contains(pid) {
+                    if agentPids.contains(pid) {
+                        Log.info("freeze: pid \(pid) of \(instances[0].name) is part of the agent's process tree, skipped")
+                        refused = true
+                        continue
+                    }
                     if byPid[pid]?.stopped == true {
                         Log.info("freeze: pid \(pid) of \(instances[0].name) is already stopped, not ours; skipped")
                         continue
@@ -317,6 +382,12 @@ enum FreezePlanner {
             for process in processes where pids.contains(process.pid) {
                 expectedParents[process.pid] = process.ppid
                 identities[process.pid] = process.identity
+            }
+            // An app with any protected process is left whole: stopping the
+            // rest would hang its UI and block the protected part's output.
+            if refused {
+                Log.info("freeze: \(instances[0].name) holds part of the agent's process tree, left running as a whole")
+                continue
             }
             out.append(FreezeGroup(bundleId: id, name: instances[0].name, pids: pids, expectedParents: expectedParents, identities: identities))
         }
@@ -429,9 +500,25 @@ struct Freezer: Freezing {
                     startedAtMicros: Int32(truncatingIfNeeded: started.tv_usec),
                     bootSession: boot
                 ),
-                stopped: p.kp_proc.p_stat == UInt8(SSTOP)
+                stopped: p.kp_proc.p_stat == UInt8(SSTOP),
+                executable: executable(of: p)
             ))
         }
         return out
+    }
+
+    /// Full path from the kernel, else the short command name. One cheap
+    /// syscall per process; a path that cannot be read (another user's
+    /// process) falls back to `p_comm`.
+    private static func executable(of p: kinfo_proc) -> String {
+        var path = [CChar](repeating: 0, count: 4096)
+        if proc_pidpath(p.kp_proc.p_pid, &path, UInt32(path.count)) > 0 {
+            return String(decoding: path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+        var comm = p.kp_proc.p_comm
+        let capacity = MemoryLayout.size(ofValue: comm)
+        return withUnsafePointer(to: &comm) {
+            $0.withMemoryRebound(to: CChar.self, capacity: capacity) { String(cString: $0) }
+        }
     }
 }
