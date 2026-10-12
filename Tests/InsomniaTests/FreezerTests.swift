@@ -352,4 +352,85 @@ final class FreezerTests: XCTestCase {
         c.freezeAllApps = false
         XCTAssertEqual(f.plan(config: c).map(\.bundleId), ["com.tinyspeck.slackmacgap"])
     }
+
+    // Cursor (1000) with a helper app (1001), a Electron helper under it
+    // (1002), the extension host (1003), a claude child (1004), node and
+    // python MCP servers (1005, 1006) and Chrome for Testing under the node
+    // one (1007). Obsidian, Discord and WhatsApp sit beside it.
+    private let cursorId = "com.todesktop.230313mzl4w4u92"
+    private var cursorProcesses: [ProcessEntry] {
+        [
+            ProcessEntry(pid: 1, ppid: 0, startedAt: 1),
+            ProcessEntry(pid: 1000, ppid: 1, startedAt: 10000, executable: "/Applications/Cursor.app/Contents/MacOS/Cursor"),
+            ProcessEntry(pid: 1001, ppid: 1000, startedAt: 10001, executable: "Cursor Helper"),
+            ProcessEntry(pid: 1002, ppid: 1000, startedAt: 10002, executable: "com.github.Electron.helper"),
+            ProcessEntry(pid: 1003, ppid: 1001, startedAt: 10003, executable: "node"),
+            ProcessEntry(pid: 1004, ppid: 1003, startedAt: 10004, executable: "/Users/me/.local/bin/claude"),
+            ProcessEntry(pid: 1005, ppid: 1004, startedAt: 10005, executable: "node"),
+            ProcessEntry(pid: 1006, ppid: 1004, startedAt: 10006, executable: "python3"),
+            ProcessEntry(pid: 1007, ppid: 1005, startedAt: 10007, executable: "Google Chrome for Testing"),
+            ProcessEntry(pid: 2000, ppid: 1, startedAt: 20000),
+            ProcessEntry(pid: 2001, ppid: 2000, startedAt: 20001),
+            ProcessEntry(pid: 3000, ppid: 1, startedAt: 30000),
+            ProcessEntry(pid: 4000, ppid: 1, startedAt: 40000),
+        ]
+    }
+    private var cursorApps: [RunningApp] {
+        [
+            RunningApp(pid: 1000, bundleId: cursorId, name: "Cursor"),
+            RunningApp(pid: 1001, bundleId: cursorId + ".helper", name: "Cursor Helper", activationPolicy: .accessory),
+            RunningApp(pid: 1002, bundleId: "com.github.Electron.helper", name: "Electron Helper", activationPolicy: .prohibited),
+            RunningApp(pid: 1007, bundleId: "com.google.chrome.for.testing", name: "Chrome for Testing"),
+            RunningApp(pid: 2000, bundleId: "md.obsidian", name: "Obsidian"),
+            RunningApp(pid: 3000, bundleId: "com.hnc.Discord", name: "Discord"),
+            RunningApp(pid: 4000, bundleId: "net.whatsapp.WhatsApp", name: "WhatsApp"),
+        ]
+    }
+
+    func testCursorAgentTreeIsNeverFrozenButOtherAppsAre() {
+        var c = Config()
+        c.agentList = [cursorId]
+        // Every id that could reach the plan, agent ones forced onto the list.
+        let ids = [cursorId, cursorId + ".helper", "com.github.Electron.helper", "com.google.chrome.for.testing",
+                   "md.obsidian", "com.hnc.Discord", "net.whatsapp.WhatsApp"]
+        let groups = FreezePlanner.groups(bundleIds: ids, apps: cursorApps, processes: cursorProcesses, config: c)
+        XCTAssertEqual(groups.map(\.bundleId), ["md.obsidian", "com.hnc.Discord", "net.whatsapp.WhatsApp"])
+        XCTAssertEqual(groups.map(\.pids), [[2000, 2001], [3000], [4000]])
+    }
+
+    func testAgentTreeIsProtectedEvenWhenCursorIsNotOnTheAgentList() {
+        // The claude process and Chrome for Testing alone protect their
+        // ancestors and descendants: Cursor's main process, the extension
+        // host and the MCP servers. A sibling helper off that path is not.
+        var c = Config()
+        c.agentList = []
+        let ids = [cursorId, cursorId + ".helper", "com.github.Electron.helper", "md.obsidian"]
+        let groups = FreezePlanner.groups(bundleIds: ids, apps: cursorApps, processes: cursorProcesses, config: c)
+        XCTAssertEqual(Set(groups.flatMap(\.pids)), [1002, 2000, 2001])
+    }
+
+    func testHelperIdsAndChromeForTestingAreDenied() {
+        var c = Config()
+        c.agentList = [cursorId]
+        XCTAssertTrue(FreezePlanner.isDenied(cursorId + ".helper.Renderer", config: c))
+        XCTAssertFalse(FreezePlanner.isDenied(cursorId + "x", config: c))
+        XCTAssertTrue(FreezePlanner.isDenied("com.google.chrome.for.testing", config: Config()))
+        XCTAssertFalse(FreezePlanner.isDenied("com.google.chrome", config: c))
+    }
+
+    func testClaudeIsFoundByNameOrPathSuffix() {
+        XCTAssertTrue(ProcessEntry(pid: 1, ppid: 0, startedAt: 1, executable: "claude").isClaude)
+        XCTAssertTrue(ProcessEntry(pid: 1, ppid: 0, startedAt: 1, executable: "/opt/bin/claude").isClaude)
+        XCTAssertFalse(ProcessEntry(pid: 1, ppid: 0, startedAt: 1, executable: "/opt/bin/claude-helper").isClaude)
+        XCTAssertFalse(ProcessEntry(pid: 1, ppid: 0, startedAt: 1, executable: "").isClaude)
+    }
+
+    func testPlanOnLidCloseDefaultsFreezesOnlyTheNonAgentApps() {
+        // Default freezeList plus Obsidian, through the lid-close scope.
+        var c = Config()
+        c.freezeList = ["md.obsidian", "com.hnc.Discord", "net.whatsapp.WhatsApp", cursorId, "com.google.chrome.for.testing"]
+        let ids = FreezePlanner.lidCloseBundleIds(config: c, apps: cursorApps)
+        let groups = FreezePlanner.groups(bundleIds: ids, apps: cursorApps, processes: cursorProcesses, config: c)
+        XCTAssertEqual(Set(groups.flatMap(\.pids)), [2000, 2001, 3000, 4000])
+    }
 }

@@ -692,8 +692,8 @@ extension ProcessIdentity {
 }
 
 extension ProcessEntry {
-    init(pid: Int32, ppid: Int32, startedAt: Int64, stopped: Bool = false) {
-        self.init(pid: pid, ppid: ppid, identity: ProcessIdentity(startedAt: startedAt), stopped: stopped)
+    init(pid: Int32, ppid: Int32, startedAt: Int64, stopped: Bool = false, executable: String = "") {
+        self.init(pid: pid, ppid: ppid, identity: ProcessIdentity(startedAt: startedAt), stopped: stopped, executable: executable)
     }
 }
 
